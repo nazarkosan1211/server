@@ -11,7 +11,7 @@ CORS(app)
 # =======================
 # DATABASE
 # =======================
-# Ganti dengan DATABASE_URL PostgreSQL kamu
+# Ganti DATABASE_URL sesuai PostgreSQL Railway
 DATABASE_URL = "postgresql://postgres:VeHwVtiMUtrLddWDoPoGggYAyupuASZS@turntable.proxy.rlwy.net:27947/railway"
 
 engine = create_engine(DATABASE_URL)
@@ -31,7 +31,6 @@ class User(Base):
     ref_by = Column(String, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
-# Create tables otomatis jika belum ada
 Base.metadata.create_all(bind=engine)
 
 # =======================
@@ -42,16 +41,20 @@ REF_LIMIT = 20
 REF_POINT = 10
 
 # =======================
+# ROOT TEST
+# =======================
+@app.route("/")
+def root():
+    return "Server is online!"
+
+# =======================
 # ENDPOINTS
 # =======================
 @app.route("/start_user", methods=["POST"])
 def start_user():
-    data = request.json or {}
+    data = request.json
     user_id = str(data.get("user_id"))
     ref = str(data.get("ref")) if data.get("ref") else None
-
-    if not user_id:
-        return jsonify({"status": "error", "message": "user_id kosong"}), 400
 
     session = SessionLocal()
     user = session.query(User).filter(User.user_id == user_id).first()
@@ -59,8 +62,7 @@ def start_user():
         user = User(user_id=user_id, ref_by=ref if ref != user_id else None)
         session.add(user)
         session.commit()
-
-        # Update referrer
+        # update referrer
         if ref:
             ref_user = session.query(User).filter(User.user_id == ref).first()
             if ref_user and ref_user.ref_count < REF_LIMIT:
@@ -72,12 +74,9 @@ def start_user():
 
 @app.route("/add_coin", methods=["POST"])
 def add_coin():
-    data = request.json or {}
+    data = request.json
     user_id = str(data.get("user_id"))
     amount = int(data.get("amount", 0))
-
-    if not user_id:
-        return jsonify({"status": "error", "message": "user_id kosong"}), 400
 
     session = SessionLocal()
     user = session.query(User).filter(User.user_id == user_id).first()
@@ -85,7 +84,7 @@ def add_coin():
         session.close()
         return jsonify({"status": "error", "message": "User not found"}), 404
 
-    # Cek daily limit
+    # daily task limit
     if amount > 0:
         if user.tasks_done >= DAILY_TASK_LIMIT:
             session.close()
