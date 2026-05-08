@@ -20,9 +20,9 @@ Base = declarative_base()
 DAILY_TASK_LIMIT = 30
 COOLDOWN_SECONDS = 15
 TASK_TOKEN_EXPIRE = 60
+
 REF_LIMIT = 20
 REF_POINT = 10
-
 RESET_HOUR_WIB = 3
 
 class User(Base):
@@ -43,6 +43,8 @@ class User(Base):
     last_reset_day = Column(String, default="")
 
     ref_count = Column(Integer, default=0)
+    total_ref_count = Column(Integer, default=0)
+    today_ref_count = Column(Integer, default=0)
     ref_by = Column(String, nullable=True)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -74,6 +76,18 @@ def ensure_columns():
         if "last_reset_day" not in existing:
             conn.execute(text("ALTER TABLE users ADD COLUMN last_reset_day VARCHAR DEFAULT ''"))
 
+        if "total_ref_count" not in existing:
+            conn.execute(text("ALTER TABLE users ADD COLUMN total_ref_count INTEGER DEFAULT 0"))
+
+        if "today_ref_count" not in existing:
+            conn.execute(text("ALTER TABLE users ADD COLUMN today_ref_count INTEGER DEFAULT 0"))
+
+        conn.execute(text("""
+            UPDATE users
+            SET total_ref_count = ref_count
+            WHERE total_ref_count = 0 AND ref_count > 0
+        """))
+
         conn.commit()
 
 ensure_columns()
@@ -101,6 +115,7 @@ def reset_daily_if_needed(user):
         user.last_task_time = 0
         user.task_token = None
         user.task_token_time = 0
+        user.today_ref_count = 0
         user.last_reset_day = today_key
 
 @app.route("/")
@@ -139,10 +154,15 @@ def start_user():
         if ref and ref != user_id:
             ref_user = session.query(User).filter(User.user_id == ref).first()
 
-            if ref_user and ref_user.ref_count < REF_LIMIT:
-                ref_user.coins += REF_POINT
-                ref_user.ref_count += 1
-                session.commit()
+            if ref_user:
+                reset_daily_if_needed(ref_user)
+
+                if ref_user.today_ref_count < REF_LIMIT:
+                    ref_user.coins += REF_POINT
+                    ref_user.total_ref_count += 1
+                    ref_user.today_ref_count += 1
+                    ref_user.ref_count = ref_user.total_ref_count
+                    session.commit()
 
     else:
         reset_daily_if_needed(user)
@@ -231,13 +251,17 @@ def add_coin():
 
     now = int(time.time())
 
+    total_refs = user.total_ref_count if user.total_ref_count else user.ref_count
+
     if amount == 0:
         result = {
             "status": "success",
             "coins": user.coins,
             "tasks_done": user.tasks_done,
             "remaining_tasks": user.remaining_tasks,
-            "ref_count": user.ref_count
+            "ref_count": total_refs,
+            "total_ref_count": total_refs,
+            "today_ref_count": user.today_ref_count
         }
         session.close()
         return jsonify(result)
@@ -279,7 +303,9 @@ def add_coin():
             "coins": user.coins,
             "tasks_done": user.tasks_done,
             "remaining_tasks": 0,
-            "ref_count": user.ref_count
+            "ref_count": total_refs,
+            "total_ref_count": total_refs,
+            "today_ref_count": user.today_ref_count
         })
 
     if user.last_task_time and now - user.last_task_time < COOLDOWN_SECONDS:
@@ -292,7 +318,9 @@ def add_coin():
             "coins": user.coins,
             "tasks_done": user.tasks_done,
             "remaining_tasks": user.remaining_tasks,
-            "ref_count": user.ref_count
+            "ref_count": total_refs,
+            "total_ref_count": total_refs,
+            "today_ref_count": user.today_ref_count
         })
 
     user.coins += amount
@@ -305,12 +333,16 @@ def add_coin():
 
     session.commit()
 
+    total_refs = user.total_ref_count if user.total_ref_count else user.ref_count
+
     result = {
         "status": "success",
         "coins": user.coins,
         "tasks_done": user.tasks_done,
         "remaining_tasks": user.remaining_tasks,
-        "ref_count": user.ref_count
+        "ref_count": total_refs,
+        "total_ref_count": total_refs,
+        "today_ref_count": user.today_ref_count
     }
 
     session.close()
@@ -354,6 +386,8 @@ def debug_users():
     result = []
 
     for user in users:
+        total_refs = user.total_ref_count if user.total_ref_count else user.ref_count
+
         result.append({
             "user_id": user.user_id,
             "username": user.username,
@@ -361,7 +395,8 @@ def debug_users():
             "tasks_done": user.tasks_done,
             "remaining_tasks": user.remaining_tasks,
             "last_reset_day": user.last_reset_day,
-            "ref_count": user.ref_count,
+            "total_ref_count": total_refs,
+            "today_ref_count": user.today_ref_count,
             "ref_by": user.ref_by
         })
 
