@@ -5,30 +5,23 @@ from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.sql import func
 import os
 import time
+import secrets
 
 app = Flask(__name__)
 CORS(app)
 
-# =======================
-# DATABASE
-# =======================
 DATABASE_URL = "postgresql://postgres:VeHwVtiMUtrLddWDoPoGggYAyupuASZS@turntable.proxy.rlwy.net:27947/railway"
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
 
-# =======================
-# CONSTANTS
-# =======================
 DAILY_TASK_LIMIT = 30
 COOLDOWN_SECONDS = 15
+TASK_TOKEN_EXPIRE = 60
 REF_LIMIT = 20
 REF_POINT = 10
 
-# =======================
-# TABLES
-# =======================
 class User(Base):
     __tablename__ = "users"
 
@@ -40,6 +33,9 @@ class User(Base):
     remaining_tasks = Column(Integer, default=30)
     last_task_time = Column(Integer, default=0)
 
+    task_token = Column(String, nullable=True)
+    task_token_time = Column(Integer, default=0)
+
     ref_count = Column(Integer, default=0)
     ref_by = Column(String, nullable=True)
 
@@ -47,9 +43,6 @@ class User(Base):
 
 Base.metadata.create_all(bind=engine)
 
-# =======================
-# AUTO FIX OLD DATABASE
-# =======================
 def ensure_columns():
     with engine.connect() as conn:
         columns = conn.execute(text("""
@@ -66,13 +59,16 @@ def ensure_columns():
         if "last_task_time" not in existing:
             conn.execute(text("ALTER TABLE users ADD COLUMN last_task_time INTEGER DEFAULT 0"))
 
+        if "task_token" not in existing:
+            conn.execute(text("ALTER TABLE users ADD COLUMN task_token VARCHAR"))
+
+        if "task_token_time" not in existing:
+            conn.execute(text("ALTER TABLE users ADD COLUMN task_token_time INTEGER DEFAULT 0"))
+
         conn.commit()
 
 ensure_columns()
 
-# =======================
-# ROOT
-# =======================
 @app.route("/")
 def root():
     return jsonify({
@@ -80,9 +76,6 @@ def root():
         "message": "EarnFlow server is running"
     })
 
-# =======================
-# START USER
-# =======================
 @app.route("/start_user", methods=["POST"])
 def start_user():
     data = request.json or {}
@@ -95,7 +88,6 @@ def start_user():
         return jsonify({"status": "error", "message": "No user_id"}), 400
 
     session = SessionLocal()
-
     user = session.query(User).filter(User.user_id == user_id).first()
 
     if not user:
@@ -129,18 +121,15 @@ def start_user():
         "username": username
     })
 
-# =======================
-# ADD / SYNC COIN
-# =======================
-@app.route("/add_coin", methods=["POST"])
-def add_coin():
+@app.route("/start_task", methods=["POST"])
+def start_task():
     data = request.json or {}
-
     user_id = str(data.get("user_id"))
-    amount = int(data.get("amount", 0))
+
+    if not user_id or user_id == "None":
+        return jsonify({"status": "error", "message": "No user_id"}), 400
 
     session = SessionLocal()
-
     user = session.query(User).filter(User.user_id == user_id).first()
 
     if not user:
@@ -149,38 +138,126 @@ def add_coin():
 
     now = int(time.time())
 
-    if amount > 0:
-        if user.tasks_done >= DAILY_TASK_LIMIT:
-            session.close()
-            return jsonify({
-                "status": "blocked",
-                "reason": "daily_limit",
-                "wait": 0,
-                "coins": user.coins,
-                "tasks_done": user.tasks_done,
-                "remaining_tasks": 0,
-                "ref_count": user.ref_count
-            })
+    if user.tasks_done >= DAILY_TASK_LIMIT:
+        session.close()
+        return jsonify({
+            "status": "blocked",
+            "reason": "daily_limit",
+            "remaining_tasks": 0
+        })
 
-        if user.last_task_time and now - user.last_task_time < COOLDOWN_SECONDS:
-            wait = COOLDOWN_SECONDS - (now - user.last_task_time)
-            session.close()
-            return jsonify({
-                "status": "blocked",
-                "reason": "cooldown",
-                "wait": wait,
-                "coins": user.coins,
-                "tasks_done": user.tasks_done,
-                "remaining_tasks": user.remaining_tasks,
-                "ref_count": user.ref_count
-            })
+    if user.last_task_time and now - user.last_task_time < COOLDOWN_SECONDS:
+        wait = COOLDOWN_SECONDS - (now - user.last_task_time)
+        session.close()
+        return jsonify({
+            "status": "blocked",
+            "reason": "cooldown",
+            "wait": wait
+        })
 
-        user.coins += amount
-        user.tasks_done += 1
-        user.remaining_tasks = DAILY_TASK_LIMIT - user.tasks_done
-        user.last_task_time = now
+    token = secrets.token_urlsafe(32)
 
+    user.task_token = token
+    user.task_token_time = now
+    session.commit()
+
+    session.close()
+
+    return jsonify({
+        "status": "success",
+        "task_token": token,
+        "expires_in": TASK_TOKEN_EXPIRE
+    })
+
+@app.route("/add_coin", methods=["POST"])
+def add_coin():
+    data = request.json or {}
+
+    user_id = str(data.get("user_id"))
+    amount = int(data.get("amount", 0))
+    task_token = str(data.get("task_token", ""))
+
+    session = SessionLocal()
+    user = session.query(User).filter(User.user_id == user_id).first()
+
+    if not user:
+        session.close()
+        return jsonify({"status": "error", "message": "User not found"}), 404
+
+    now = int(time.time())
+
+    if amount == 0:
+        result = {
+            "status": "success",
+            "coins": user.coins,
+            "tasks_done": user.tasks_done,
+            "remaining_tasks": user.remaining_tasks,
+            "ref_count": user.ref_count
+        }
+        session.close()
+        return jsonify(result)
+
+    if not task_token:
+        session.close()
+        return jsonify({
+            "status": "blocked",
+            "reason": "missing_task_token",
+            "message": "Invalid claim"
+        }), 403
+
+    if not user.task_token or task_token != user.task_token:
+        session.close()
+        return jsonify({
+            "status": "blocked",
+            "reason": "invalid_task_token",
+            "message": "Invalid claim"
+        }), 403
+
+    if now - int(user.task_token_time or 0) > TASK_TOKEN_EXPIRE:
+        user.task_token = None
+        user.task_token_time = 0
         session.commit()
+        session.close()
+        return jsonify({
+            "status": "blocked",
+            "reason": "expired_task_token",
+            "message": "Task expired"
+        }), 403
+
+    if user.tasks_done >= DAILY_TASK_LIMIT:
+        session.close()
+        return jsonify({
+            "status": "blocked",
+            "reason": "daily_limit",
+            "wait": 0,
+            "coins": user.coins,
+            "tasks_done": user.tasks_done,
+            "remaining_tasks": 0,
+            "ref_count": user.ref_count
+        })
+
+    if user.last_task_time and now - user.last_task_time < COOLDOWN_SECONDS:
+        wait = COOLDOWN_SECONDS - (now - user.last_task_time)
+        session.close()
+        return jsonify({
+            "status": "blocked",
+            "reason": "cooldown",
+            "wait": wait,
+            "coins": user.coins,
+            "tasks_done": user.tasks_done,
+            "remaining_tasks": user.remaining_tasks,
+            "ref_count": user.ref_count
+        })
+
+    user.coins += amount
+    user.tasks_done += 1
+    user.remaining_tasks = DAILY_TASK_LIMIT - user.tasks_done
+    user.last_task_time = now
+
+    user.task_token = None
+    user.task_token_time = 0
+
+    session.commit()
 
     result = {
         "status": "success",
@@ -193,9 +270,6 @@ def add_coin():
     session.close()
     return jsonify(result)
 
-# =======================
-# LEADERBOARD
-# =======================
 @app.route("/leaderboard", methods=["GET"])
 def leaderboard():
     session = SessionLocal()
@@ -226,13 +300,9 @@ def leaderboard():
         "leaderboard": result
     })
 
-# =======================
-# DEBUG USERS
-# =======================
 @app.route("/debug_users", methods=["GET"])
 def debug_users():
     session = SessionLocal()
-
     users = session.query(User).all()
 
     result = []
@@ -252,9 +322,6 @@ def debug_users():
 
     return jsonify(result)
 
-# =======================
-# MAIN
-# =======================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
