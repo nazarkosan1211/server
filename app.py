@@ -25,6 +25,8 @@ REF_LIMIT = 20
 REF_POINT = 10
 RESET_HOUR_WIB = 3
 
+CHECKIN_REWARDS = [2, 6, 8, 10, 14, 18, 25]
+
 class User(Base):
     __tablename__ = "users"
 
@@ -41,6 +43,9 @@ class User(Base):
     task_token_time = Column(Integer, default=0)
 
     last_reset_day = Column(String, default="")
+
+    daily_streak = Column(Integer, default=0)
+    last_checkin_day = Column(String, default="")
 
     ref_count = Column(Integer, default=0)
     total_ref_count = Column(Integer, default=0)
@@ -82,6 +87,12 @@ def ensure_columns():
         if "today_ref_count" not in existing:
             conn.execute(text("ALTER TABLE users ADD COLUMN today_ref_count INTEGER DEFAULT 0"))
 
+        if "daily_streak" not in existing:
+            conn.execute(text("ALTER TABLE users ADD COLUMN daily_streak INTEGER DEFAULT 0"))
+
+        if "last_checkin_day" not in existing:
+            conn.execute(text("ALTER TABLE users ADD COLUMN last_checkin_day VARCHAR DEFAULT ''"))
+
         conn.execute(text("""
             UPDATE users
             SET total_ref_count = ref_count
@@ -102,6 +113,10 @@ def reset_day_wib():
 
     return reset_day.isoformat()
 
+def yesterday_reset_day_wib():
+    today = datetime.fromisoformat(reset_day_wib()).date()
+    return (today - timedelta(days=1)).isoformat()
+
 def reset_daily_if_needed(user):
     today_key = reset_day_wib()
 
@@ -117,6 +132,33 @@ def reset_daily_if_needed(user):
         user.task_token_time = 0
         user.today_ref_count = 0
         user.last_reset_day = today_key
+
+def checkin_info(user):
+    today_key = reset_day_wib()
+    yesterday_key = yesterday_reset_day_wib()
+
+    already_claimed = user.last_checkin_day == today_key
+
+    streak = int(user.daily_streak or 0)
+
+    if user.last_checkin_day and user.last_checkin_day not in [today_key, yesterday_key]:
+        streak = 0
+
+    next_day = streak + 1
+
+    if next_day > 7:
+        next_day = 1
+
+    reward = CHECKIN_REWARDS[next_day - 1]
+
+    return {
+        "daily_streak": streak,
+        "next_checkin_day": next_day,
+        "next_checkin_reward": reward,
+        "last_checkin_day": user.last_checkin_day or "",
+        "can_checkin": not already_claimed,
+        "already_claimed": already_claimed
+    }
 
 @app.route("/")
 def root():
@@ -172,12 +214,15 @@ def start_user():
 
         session.commit()
 
+    info = checkin_info(user)
+
     session.close()
 
     return jsonify({
         "status": "success",
         "user_id": user_id,
-        "username": username
+        "username": username,
+        **info
     })
 
 @app.route("/start_task", methods=["POST"])
@@ -250,8 +295,8 @@ def add_coin():
     session.commit()
 
     now = int(time.time())
-
     total_refs = user.total_ref_count if user.total_ref_count else user.ref_count
+    info = checkin_info(user)
 
     if amount == 0:
         result = {
@@ -261,7 +306,8 @@ def add_coin():
             "remaining_tasks": user.remaining_tasks,
             "ref_count": total_refs,
             "total_ref_count": total_refs,
-            "today_ref_count": user.today_ref_count
+            "today_ref_count": user.today_ref_count,
+            **info
         }
         session.close()
         return jsonify(result)
@@ -305,7 +351,8 @@ def add_coin():
             "remaining_tasks": 0,
             "ref_count": total_refs,
             "total_ref_count": total_refs,
-            "today_ref_count": user.today_ref_count
+            "today_ref_count": user.today_ref_count,
+            **info
         })
 
     if user.last_task_time and now - user.last_task_time < COOLDOWN_SECONDS:
@@ -320,7 +367,8 @@ def add_coin():
             "remaining_tasks": user.remaining_tasks,
             "ref_count": total_refs,
             "total_ref_count": total_refs,
-            "today_ref_count": user.today_ref_count
+            "today_ref_count": user.today_ref_count,
+            **info
         })
 
     user.coins += amount
@@ -334,6 +382,7 @@ def add_coin():
     session.commit()
 
     total_refs = user.total_ref_count if user.total_ref_count else user.ref_count
+    info = checkin_info(user)
 
     result = {
         "status": "success",
@@ -342,7 +391,75 @@ def add_coin():
         "remaining_tasks": user.remaining_tasks,
         "ref_count": total_refs,
         "total_ref_count": total_refs,
-        "today_ref_count": user.today_ref_count
+        "today_ref_count": user.today_ref_count,
+        **info
+    }
+
+    session.close()
+    return jsonify(result)
+
+@app.route("/claim_checkin", methods=["POST"])
+def claim_checkin():
+    data = request.json or {}
+    user_id = str(data.get("user_id"))
+
+    if not user_id or user_id == "None":
+        return jsonify({"status": "error", "message": "No user_id"}), 400
+
+    session = SessionLocal()
+    user = session.query(User).filter(User.user_id == user_id).first()
+
+    if not user:
+        session.close()
+        return jsonify({"status": "error", "message": "User not found"}), 404
+
+    reset_daily_if_needed(user)
+
+    today_key = reset_day_wib()
+    yesterday_key = yesterday_reset_day_wib()
+
+    if user.last_checkin_day == today_key:
+        info = checkin_info(user)
+        session.commit()
+        session.close()
+
+        return jsonify({
+            "status": "blocked",
+            "reason": "already_claimed",
+            "message": "Daily check-in already claimed",
+            "coins": user.coins,
+            **info
+        })
+
+    if user.last_checkin_day == yesterday_key:
+        streak = int(user.daily_streak or 0) + 1
+    else:
+        streak = 1
+
+    if streak > 7:
+        streak = 1
+
+    reward = CHECKIN_REWARDS[streak - 1]
+
+    user.coins += reward
+    user.daily_streak = streak
+    user.last_checkin_day = today_key
+
+    session.commit()
+
+    total_refs = user.total_ref_count if user.total_ref_count else user.ref_count
+    info = checkin_info(user)
+
+    result = {
+        "status": "success",
+        "reward": reward,
+        "coins": user.coins,
+        "tasks_done": user.tasks_done,
+        "remaining_tasks": user.remaining_tasks,
+        "ref_count": total_refs,
+        "total_ref_count": total_refs,
+        "today_ref_count": user.today_ref_count,
+        **info
     }
 
     session.close()
@@ -395,6 +512,8 @@ def debug_users():
             "tasks_done": user.tasks_done,
             "remaining_tasks": user.remaining_tasks,
             "last_reset_day": user.last_reset_day,
+            "daily_streak": user.daily_streak,
+            "last_checkin_day": user.last_checkin_day,
             "total_ref_count": total_refs,
             "today_ref_count": user.today_ref_count,
             "ref_by": user.ref_by
