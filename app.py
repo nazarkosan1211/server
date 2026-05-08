@@ -3,7 +3,7 @@ from flask_cors import CORS
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, text
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.sql import func
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
 import time
 import secrets
@@ -11,27 +11,20 @@ import secrets
 app = Flask(__name__)
 CORS(app)
 
-# =======================
-# DATABASE
-# =======================
 DATABASE_URL = "postgresql://postgres:VeHwVtiMUtrLddWDoPoGggYAyupuASZS@turntable.proxy.rlwy.net:27947/railway"
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
 
-# =======================
-# CONSTANTS
-# =======================
 DAILY_TASK_LIMIT = 30
 COOLDOWN_SECONDS = 15
 TASK_TOKEN_EXPIRE = 60
 REF_LIMIT = 20
 REF_POINT = 10
 
-# =======================
-# TABLES
-# =======================
+RESET_HOUR_WIB = 3
+
 class User(Base):
     __tablename__ = "users"
 
@@ -56,9 +49,6 @@ class User(Base):
 
 Base.metadata.create_all(bind=engine)
 
-# =======================
-# AUTO FIX OLD DATABASE
-# =======================
 def ensure_columns():
     with engine.connect() as conn:
         columns = conn.execute(text("""
@@ -88,36 +78,39 @@ def ensure_columns():
 
 ensure_columns()
 
-# =======================
-# DAILY RESET
-# =======================
-def today_utc():
-    return datetime.utcnow().strftime("%Y-%m-%d")
+def reset_day_wib():
+    now_wib = datetime.utcnow() + timedelta(hours=7)
+
+    if now_wib.hour < RESET_HOUR_WIB:
+        reset_day = now_wib.date() - timedelta(days=1)
+    else:
+        reset_day = now_wib.date()
+
+    return reset_day.isoformat()
 
 def reset_daily_if_needed(user):
-    today = today_utc()
+    today_key = reset_day_wib()
 
-    if user.last_reset_day != today:
+    if not user.last_reset_day:
+        user.last_reset_day = today_key
+        return
+
+    if user.last_reset_day != today_key:
         user.tasks_done = 0
         user.remaining_tasks = DAILY_TASK_LIMIT
         user.last_task_time = 0
         user.task_token = None
         user.task_token_time = 0
-        user.last_reset_day = today
+        user.last_reset_day = today_key
 
-# =======================
-# ROOT
-# =======================
 @app.route("/")
 def root():
     return jsonify({
         "status": "online",
-        "message": "EarnFlow server is running"
+        "message": "EarnFlow server is running",
+        "reset_time": "03:00 WIB"
     })
 
-# =======================
-# START USER
-# =======================
 @app.route("/start_user", methods=["POST"])
 def start_user():
     data = request.json or {}
@@ -127,13 +120,9 @@ def start_user():
     ref = str(data.get("ref")) if data.get("ref") else None
 
     if not user_id or user_id == "None":
-        return jsonify({
-            "status": "error",
-            "message": "No user_id"
-        }), 400
+        return jsonify({"status": "error", "message": "No user_id"}), 400
 
     session = SessionLocal()
-
     user = session.query(User).filter(User.user_id == user_id).first()
 
     if not user:
@@ -141,7 +130,7 @@ def start_user():
             user_id=user_id,
             username=username,
             ref_by=ref if ref and ref != user_id else None,
-            last_reset_day=today_utc()
+            last_reset_day=reset_day_wib()
         )
 
         session.add(user)
@@ -171,31 +160,20 @@ def start_user():
         "username": username
     })
 
-# =======================
-# START TASK TOKEN
-# =======================
 @app.route("/start_task", methods=["POST"])
 def start_task():
     data = request.json or {}
-
     user_id = str(data.get("user_id"))
 
     if not user_id or user_id == "None":
-        return jsonify({
-            "status": "error",
-            "message": "No user_id"
-        }), 400
+        return jsonify({"status": "error", "message": "No user_id"}), 400
 
     session = SessionLocal()
-
     user = session.query(User).filter(User.user_id == user_id).first()
 
     if not user:
         session.close()
-        return jsonify({
-            "status": "error",
-            "message": "User not found"
-        }), 404
+        return jsonify({"status": "error", "message": "User not found"}), 404
 
     reset_daily_if_needed(user)
     session.commit()
@@ -212,7 +190,6 @@ def start_task():
 
     if user.last_task_time and now - user.last_task_time < COOLDOWN_SECONDS:
         wait = COOLDOWN_SECONDS - (now - user.last_task_time)
-
         session.close()
         return jsonify({
             "status": "blocked",
@@ -234,9 +211,6 @@ def start_task():
         "expires_in": TASK_TOKEN_EXPIRE
     })
 
-# =======================
-# ADD / SYNC COIN
-# =======================
 @app.route("/add_coin", methods=["POST"])
 def add_coin():
     data = request.json or {}
@@ -246,15 +220,11 @@ def add_coin():
     task_token = str(data.get("task_token", ""))
 
     session = SessionLocal()
-
     user = session.query(User).filter(User.user_id == user_id).first()
 
     if not user:
         session.close()
-        return jsonify({
-            "status": "error",
-            "message": "User not found"
-        }), 404
+        return jsonify({"status": "error", "message": "User not found"}), 404
 
     reset_daily_if_needed(user)
     session.commit()
@@ -269,7 +239,6 @@ def add_coin():
             "remaining_tasks": user.remaining_tasks,
             "ref_count": user.ref_count
         }
-
         session.close()
         return jsonify(result)
 
@@ -315,7 +284,6 @@ def add_coin():
 
     if user.last_task_time and now - user.last_task_time < COOLDOWN_SECONDS:
         wait = COOLDOWN_SECONDS - (now - user.last_task_time)
-
         session.close()
         return jsonify({
             "status": "blocked",
@@ -348,9 +316,6 @@ def add_coin():
     session.close()
     return jsonify(result)
 
-# =======================
-# LEADERBOARD
-# =======================
 @app.route("/leaderboard", methods=["GET"])
 def leaderboard():
     session = SessionLocal()
@@ -381,13 +346,9 @@ def leaderboard():
         "leaderboard": result
     })
 
-# =======================
-# DEBUG USERS
-# =======================
 @app.route("/debug_users", methods=["GET"])
 def debug_users():
     session = SessionLocal()
-
     users = session.query(User).all()
 
     result = []
@@ -408,9 +369,17 @@ def debug_users():
 
     return jsonify(result)
 
-# =======================
-# MAIN
-# =======================
+@app.route("/debug_reset_time", methods=["GET"])
+def debug_reset_time():
+    now_wib = datetime.utcnow() + timedelta(hours=7)
+
+    return jsonify({
+        "status": "success",
+        "now_wib": now_wib.strftime("%Y-%m-%d %H:%M:%S"),
+        "reset_hour_wib": RESET_HOUR_WIB,
+        "current_reset_day": reset_day_wib()
+    })
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
