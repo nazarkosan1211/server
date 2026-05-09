@@ -7,11 +7,16 @@ from datetime import datetime, timedelta
 import os
 import time
 import secrets
+import requests
 
 app = Flask(__name__)
 CORS(app)
 
 DATABASE_URL = "postgresql://postgres:VeHwVtiMUtrLddWDoPoGggYAyupuASZS@turntable.proxy.rlwy.net:27947/railway"
+
+BOT_TOKEN = "8707863883:AAGePtyGNttlo3EfLT1GXGKlBqFY9TBQ5G0"
+CHANNEL_USERNAME = "@earnflowtaps"
+CHANNEL_REWARD = 15
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine)
@@ -46,6 +51,8 @@ class User(Base):
 
     daily_streak = Column(Integer, default=0)
     last_checkin_day = Column(String, default="")
+
+    joined_channel_claimed = Column(Integer, default=0)
 
     ref_count = Column(Integer, default=0)
     total_ref_count = Column(Integer, default=0)
@@ -93,6 +100,9 @@ def ensure_columns():
         if "last_checkin_day" not in existing:
             conn.execute(text("ALTER TABLE users ADD COLUMN last_checkin_day VARCHAR DEFAULT ''"))
 
+        if "joined_channel_claimed" not in existing:
+            conn.execute(text("ALTER TABLE users ADD COLUMN joined_channel_claimed INTEGER DEFAULT 0"))
+
         conn.execute(text("""
             UPDATE users
             SET total_ref_count = ref_count
@@ -138,7 +148,6 @@ def checkin_info(user):
     yesterday_key = yesterday_reset_day_wib()
 
     already_claimed = user.last_checkin_day == today_key
-
     streak = int(user.daily_streak or 0)
 
     if user.last_checkin_day and user.last_checkin_day not in [today_key, yesterday_key]:
@@ -160,12 +169,57 @@ def checkin_info(user):
         "already_claimed": already_claimed
     }
 
+def user_response(user):
+    total_refs = user.total_ref_count if user.total_ref_count else user.ref_count
+
+    return {
+        "coins": user.coins,
+        "tasks_done": user.tasks_done,
+        "remaining_tasks": user.remaining_tasks,
+        "ref_count": total_refs,
+        "total_ref_count": total_refs,
+        "today_ref_count": user.today_ref_count,
+        "joined_channel_claimed": int(user.joined_channel_claimed or 0),
+        "channel_username": CHANNEL_USERNAME,
+        "channel_reward": CHANNEL_REWARD,
+        **checkin_info(user)
+    }
+
+def is_user_in_channel(user_id):
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/getChatMember"
+
+        response = requests.get(
+            url,
+            params={
+                "chat_id": CHANNEL_USERNAME,
+                "user_id": user_id
+            },
+            timeout=15
+        )
+
+        data = response.json()
+
+        if not data.get("ok"):
+            return False, data
+
+        status = data.get("result", {}).get("status", "")
+
+        if status in ["member", "administrator", "creator"]:
+            return True, data
+
+        return False, data
+
+    except Exception as e:
+        return False, {"error": str(e)}
+
 @app.route("/")
 def root():
     return jsonify({
         "status": "online",
         "message": "EarnFlow server is running",
-        "reset_time": "03:00 WIB"
+        "reset_time": "03:00 WIB",
+        "channel": CHANNEL_USERNAME
     })
 
 @app.route("/start_user", methods=["POST"])
@@ -214,16 +268,15 @@ def start_user():
 
         session.commit()
 
-    info = checkin_info(user)
-
-    session.close()
-
-    return jsonify({
+    result = {
         "status": "success",
         "user_id": user_id,
         "username": username,
-        **info
-    })
+        **user_response(user)
+    }
+
+    session.close()
+    return jsonify(result)
 
 @app.route("/start_task", methods=["POST"])
 def start_task():
@@ -295,19 +348,11 @@ def add_coin():
     session.commit()
 
     now = int(time.time())
-    total_refs = user.total_ref_count if user.total_ref_count else user.ref_count
-    info = checkin_info(user)
 
     if amount == 0:
         result = {
             "status": "success",
-            "coins": user.coins,
-            "tasks_done": user.tasks_done,
-            "remaining_tasks": user.remaining_tasks,
-            "ref_count": total_refs,
-            "total_ref_count": total_refs,
-            "today_ref_count": user.today_ref_count,
-            **info
+            **user_response(user)
         }
         session.close()
         return jsonify(result)
@@ -341,35 +386,26 @@ def add_coin():
         }), 403
 
     if user.tasks_done >= DAILY_TASK_LIMIT:
-        session.close()
-        return jsonify({
+        result = {
             "status": "blocked",
             "reason": "daily_limit",
             "wait": 0,
-            "coins": user.coins,
-            "tasks_done": user.tasks_done,
-            "remaining_tasks": 0,
-            "ref_count": total_refs,
-            "total_ref_count": total_refs,
-            "today_ref_count": user.today_ref_count,
-            **info
-        })
+            **user_response(user)
+        }
+        result["remaining_tasks"] = 0
+        session.close()
+        return jsonify(result)
 
     if user.last_task_time and now - user.last_task_time < COOLDOWN_SECONDS:
         wait = COOLDOWN_SECONDS - (now - user.last_task_time)
-        session.close()
-        return jsonify({
+        result = {
             "status": "blocked",
             "reason": "cooldown",
             "wait": wait,
-            "coins": user.coins,
-            "tasks_done": user.tasks_done,
-            "remaining_tasks": user.remaining_tasks,
-            "ref_count": total_refs,
-            "total_ref_count": total_refs,
-            "today_ref_count": user.today_ref_count,
-            **info
-        })
+            **user_response(user)
+        }
+        session.close()
+        return jsonify(result)
 
     user.coins += amount
     user.tasks_done += 1
@@ -381,18 +417,9 @@ def add_coin():
 
     session.commit()
 
-    total_refs = user.total_ref_count if user.total_ref_count else user.ref_count
-    info = checkin_info(user)
-
     result = {
         "status": "success",
-        "coins": user.coins,
-        "tasks_done": user.tasks_done,
-        "remaining_tasks": user.remaining_tasks,
-        "ref_count": total_refs,
-        "total_ref_count": total_refs,
-        "today_ref_count": user.today_ref_count,
-        **info
+        **user_response(user)
     }
 
     session.close()
@@ -419,17 +446,15 @@ def claim_checkin():
     yesterday_key = yesterday_reset_day_wib()
 
     if user.last_checkin_day == today_key:
-        info = checkin_info(user)
-        session.commit()
-        session.close()
-
-        return jsonify({
+        result = {
             "status": "blocked",
             "reason": "already_claimed",
             "message": "Daily check-in already claimed",
-            "coins": user.coins,
-            **info
-        })
+            **user_response(user)
+        }
+        session.commit()
+        session.close()
+        return jsonify(result)
 
     if user.last_checkin_day == yesterday_key:
         streak = int(user.daily_streak or 0) + 1
@@ -447,19 +472,67 @@ def claim_checkin():
 
     session.commit()
 
-    total_refs = user.total_ref_count if user.total_ref_count else user.ref_count
-    info = checkin_info(user)
-
     result = {
         "status": "success",
         "reward": reward,
-        "coins": user.coins,
-        "tasks_done": user.tasks_done,
-        "remaining_tasks": user.remaining_tasks,
-        "ref_count": total_refs,
-        "total_ref_count": total_refs,
-        "today_ref_count": user.today_ref_count,
-        **info
+        **user_response(user)
+    }
+
+    session.close()
+    return jsonify(result)
+
+@app.route("/verify_channel", methods=["POST"])
+def verify_channel():
+    data = request.json or {}
+    user_id = str(data.get("user_id"))
+
+    if not user_id or user_id == "None":
+        return jsonify({"status": "error", "message": "No user_id"}), 400
+
+    session = SessionLocal()
+    user = session.query(User).filter(User.user_id == user_id).first()
+
+    if not user:
+        session.close()
+        return jsonify({"status": "error", "message": "User not found"}), 404
+
+    reset_daily_if_needed(user)
+
+    if int(user.joined_channel_claimed or 0) == 1:
+        result = {
+            "status": "blocked",
+            "reason": "already_claimed",
+            "message": "Channel reward already claimed",
+            **user_response(user)
+        }
+        session.commit()
+        session.close()
+        return jsonify(result)
+
+    is_member, tg_response = is_user_in_channel(user_id)
+
+    if not is_member:
+        result = {
+            "status": "blocked",
+            "reason": "not_joined",
+            "message": "Please join the channel first",
+            "telegram_response": tg_response,
+            **user_response(user)
+        }
+        session.commit()
+        session.close()
+        return jsonify(result)
+
+    user.coins += CHANNEL_REWARD
+    user.joined_channel_claimed = 1
+
+    session.commit()
+
+    result = {
+        "status": "success",
+        "reward": CHANNEL_REWARD,
+        "message": "Channel task completed",
+        **user_response(user)
     }
 
     session.close()
@@ -514,13 +587,13 @@ def debug_users():
             "last_reset_day": user.last_reset_day,
             "daily_streak": user.daily_streak,
             "last_checkin_day": user.last_checkin_day,
+            "joined_channel_claimed": user.joined_channel_claimed,
             "total_ref_count": total_refs,
             "today_ref_count": user.today_ref_count,
             "ref_by": user.ref_by
         })
 
     session.close()
-
     return jsonify(result)
 
 @app.route("/debug_reset_time", methods=["GET"])
@@ -532,6 +605,14 @@ def debug_reset_time():
         "now_wib": now_wib.strftime("%Y-%m-%d %H:%M:%S"),
         "reset_hour_wib": RESET_HOUR_WIB,
         "current_reset_day": reset_day_wib()
+    })
+
+@app.route("/debug_channel", methods=["GET"])
+def debug_channel():
+    return jsonify({
+        "status": "success",
+        "channel_username": CHANNEL_USERNAME,
+        "channel_reward": CHANNEL_REWARD
     })
 
 if __name__ == "__main__":
