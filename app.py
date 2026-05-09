@@ -1,6 +1,6 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, text
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, text, func as sa_func
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.sql import func
 from datetime import datetime, timedelta
@@ -12,11 +12,17 @@ import requests
 app = Flask(__name__)
 CORS(app)
 
+# =======================
+# CONFIG
+# =======================
 DATABASE_URL = "postgresql://postgres:VeHwVtiMUtrLddWDoPoGggYAyupuASZS@turntable.proxy.rlwy.net:27947/railway"
 
 BOT_TOKEN = "8707863883:AAGePtyGNttlo3EfLT1GXGKlBqFY9TBQ5G0"
 CHANNEL_USERNAME = "@earnflowtaps"
 CHANNEL_REWARD = 15
+
+# GANTI INI NANTI KALAU SUDAH MAU PUBLIC
+ADMIN_KEY = "earnflow_admin_2026"
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine)
@@ -32,6 +38,9 @@ RESET_HOUR_WIB = 3
 
 CHECKIN_REWARDS = [2, 6, 8, 10, 14, 18, 25]
 
+# =======================
+# DATABASE TABLE
+# =======================
 class User(Base):
     __tablename__ = "users"
 
@@ -59,10 +68,17 @@ class User(Base):
     today_ref_count = Column(Integer, default=0)
     ref_by = Column(String, nullable=True)
 
+    # Admin Panel V1
+    is_banned = Column(Integer, default=0)
+    admin_note = Column(String, nullable=True)
+
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 Base.metadata.create_all(bind=engine)
 
+# =======================
+# MIGRATION SAFE COLUMNS
+# =======================
 def ensure_columns():
     with engine.connect() as conn:
         columns = conn.execute(text("""
@@ -103,6 +119,12 @@ def ensure_columns():
         if "joined_channel_claimed" not in existing:
             conn.execute(text("ALTER TABLE users ADD COLUMN joined_channel_claimed INTEGER DEFAULT 0"))
 
+        if "is_banned" not in existing:
+            conn.execute(text("ALTER TABLE users ADD COLUMN is_banned INTEGER DEFAULT 0"))
+
+        if "admin_note" not in existing:
+            conn.execute(text("ALTER TABLE users ADD COLUMN admin_note VARCHAR"))
+
         conn.execute(text("""
             UPDATE users
             SET total_ref_count = ref_count
@@ -112,6 +134,13 @@ def ensure_columns():
         conn.commit()
 
 ensure_columns()
+
+# =======================
+# HELPERS
+# =======================
+def admin_ok(req):
+    key = req.args.get("key") or (req.json or {}).get("key") if req.is_json else req.args.get("key")
+    return key == ADMIN_KEY
 
 def reset_day_wib():
     now_wib = datetime.utcnow() + timedelta(hours=7)
@@ -180,6 +209,7 @@ def user_response(user):
         "total_ref_count": total_refs,
         "today_ref_count": user.today_ref_count,
         "joined_channel_claimed": int(user.joined_channel_claimed or 0),
+        "is_banned": int(user.is_banned or 0),
         "channel_username": CHANNEL_USERNAME,
         "channel_reward": CHANNEL_REWARD,
         **checkin_info(user)
@@ -213,13 +243,35 @@ def is_user_in_channel(user_id):
     except Exception as e:
         return False, {"error": str(e)}
 
+def admin_user_json(user):
+    total_refs = user.total_ref_count if user.total_ref_count else user.ref_count
+    return {
+        "user_id": user.user_id,
+        "username": user.username or "",
+        "coins": int(user.coins or 0),
+        "tasks_done": int(user.tasks_done or 0),
+        "remaining_tasks": int(user.remaining_tasks or 0),
+        "daily_streak": int(user.daily_streak or 0),
+        "joined_channel_claimed": int(user.joined_channel_claimed or 0),
+        "total_ref_count": int(total_refs or 0),
+        "today_ref_count": int(user.today_ref_count or 0),
+        "ref_by": user.ref_by or "",
+        "is_banned": int(user.is_banned or 0),
+        "admin_note": user.admin_note or "",
+        "created_at": str(user.created_at) if user.created_at else ""
+    }
+
+# =======================
+# PUBLIC ROUTES
+# =======================
 @app.route("/")
 def root():
     return jsonify({
         "status": "online",
         "message": "EarnFlow server is running",
         "reset_time": "03:00 WIB",
-        "channel": CHANNEL_USERNAME
+        "channel": CHANNEL_USERNAME,
+        "admin": "Admin Panel V1 endpoints active"
     })
 
 @app.route("/start_user", methods=["POST"])
@@ -293,6 +345,10 @@ def start_task():
         session.close()
         return jsonify({"status": "error", "message": "User not found"}), 404
 
+    if int(user.is_banned or 0) == 1:
+        session.close()
+        return jsonify({"status": "blocked", "reason": "banned", "message": "User banned"}), 403
+
     reset_daily_if_needed(user)
     session.commit()
 
@@ -343,6 +399,10 @@ def add_coin():
     if not user:
         session.close()
         return jsonify({"status": "error", "message": "User not found"}), 404
+
+    if int(user.is_banned or 0) == 1:
+        session.close()
+        return jsonify({"status": "blocked", "reason": "banned", "message": "User banned"}), 403
 
     reset_daily_if_needed(user)
     session.commit()
@@ -440,6 +500,10 @@ def claim_checkin():
         session.close()
         return jsonify({"status": "error", "message": "User not found"}), 404
 
+    if int(user.is_banned or 0) == 1:
+        session.close()
+        return jsonify({"status": "blocked", "reason": "banned", "message": "User banned"}), 403
+
     reset_daily_if_needed(user)
 
     today_key = reset_day_wib()
@@ -495,6 +559,10 @@ def verify_channel():
     if not user:
         session.close()
         return jsonify({"status": "error", "message": "User not found"}), 404
+
+    if int(user.is_banned or 0) == 1:
+        session.close()
+        return jsonify({"status": "blocked", "reason": "banned", "message": "User banned"}), 403
 
     reset_daily_if_needed(user)
 
@@ -568,6 +636,167 @@ def leaderboard():
         "leaderboard": result
     })
 
+# =======================
+# ADMIN PANEL API V1
+# =======================
+@app.route("/admin_stats", methods=["GET"])
+def admin_stats():
+    if not admin_ok(request):
+        return jsonify({"status": "error", "message": "Invalid admin key"}), 403
+
+    session = SessionLocal()
+    total_users = session.query(User).count()
+    total_points = session.query(sa_func.coalesce(sa_func.sum(User.coins), 0)).scalar()
+    total_tasks_done = session.query(sa_func.coalesce(sa_func.sum(User.tasks_done), 0)).scalar()
+    total_referrals = session.query(sa_func.coalesce(sa_func.sum(User.total_ref_count), 0)).scalar()
+    total_today_referrals = session.query(sa_func.coalesce(sa_func.sum(User.today_ref_count), 0)).scalar()
+    total_banned = session.query(User).filter(User.is_banned == 1).count()
+    channel_claimed = session.query(User).filter(User.joined_channel_claimed == 1).count()
+
+    session.close()
+
+    return jsonify({
+        "status": "success",
+        "stats": {
+            "total_users": int(total_users or 0),
+            "total_points": int(total_points or 0),
+            "total_tasks_done_today": int(total_tasks_done or 0),
+            "total_referrals": int(total_referrals or 0),
+            "today_referrals": int(total_today_referrals or 0),
+            "banned_users": int(total_banned or 0),
+            "channel_claimed": int(channel_claimed or 0),
+            "reset_day": reset_day_wib()
+        }
+    })
+
+@app.route("/admin_users", methods=["GET"])
+def admin_users():
+    if not admin_ok(request):
+        return jsonify({"status": "error", "message": "Invalid admin key"}), 403
+
+    q = (request.args.get("q") or "").strip()
+    limit = int(request.args.get("limit", 50))
+
+    if limit > 200:
+        limit = 200
+
+    session = SessionLocal()
+    query = session.query(User)
+
+    if q:
+        like = f"%{q}%"
+        query = query.filter(
+            (User.user_id.ilike(like)) |
+            (User.username.ilike(like)) |
+            (User.ref_by.ilike(like))
+        )
+
+    users = query.order_by(User.coins.desc()).limit(limit).all()
+    result = [admin_user_json(user) for user in users]
+
+    session.close()
+
+    return jsonify({
+        "status": "success",
+        "users": result
+    })
+
+@app.route("/admin_update_user", methods=["POST"])
+def admin_update_user():
+    if not admin_ok(request):
+        return jsonify({"status": "error", "message": "Invalid admin key"}), 403
+
+    data = request.json or {}
+    user_id = str(data.get("user_id", "")).strip()
+
+    if not user_id:
+        return jsonify({"status": "error", "message": "Missing user_id"}), 400
+
+    session = SessionLocal()
+    user = session.query(User).filter(User.user_id == user_id).first()
+
+    if not user:
+        session.close()
+        return jsonify({"status": "error", "message": "User not found"}), 404
+
+    action = data.get("action")
+    amount = int(data.get("amount", 0))
+    note = str(data.get("note", "")).strip()
+
+    if action == "add_points":
+        user.coins += amount
+
+    elif action == "remove_points":
+        user.coins = max(0, int(user.coins or 0) - amount)
+
+    elif action == "set_points":
+        user.coins = max(0, amount)
+
+    elif action == "reset_tasks":
+        user.tasks_done = 0
+        user.remaining_tasks = DAILY_TASK_LIMIT
+        user.last_task_time = 0
+        user.task_token = None
+        user.task_token_time = 0
+
+    elif action == "ban":
+        user.is_banned = 1
+
+    elif action == "unban":
+        user.is_banned = 0
+
+    elif action == "note":
+        user.admin_note = note
+
+    else:
+        session.close()
+        return jsonify({"status": "error", "message": "Invalid action"}), 400
+
+    if note and action != "note":
+        user.admin_note = note
+
+    session.commit()
+    result = admin_user_json(user)
+    session.close()
+
+    return jsonify({
+        "status": "success",
+        "user": result
+    })
+
+@app.route("/admin_referrals", methods=["GET"])
+def admin_referrals():
+    if not admin_ok(request):
+        return jsonify({"status": "error", "message": "Invalid admin key"}), 403
+
+    session = SessionLocal()
+    users = (
+        session.query(User)
+        .filter(User.ref_by != None)
+        .order_by(User.created_at.desc())
+        .limit(200)
+        .all()
+    )
+
+    result = []
+    for user in users:
+        result.append({
+            "new_user_id": user.user_id,
+            "new_username": user.username or "",
+            "ref_by": user.ref_by or "",
+            "created_at": str(user.created_at) if user.created_at else ""
+        })
+
+    session.close()
+
+    return jsonify({
+        "status": "success",
+        "referrals": result
+    })
+
+# =======================
+# DEBUG ROUTES
+# =======================
 @app.route("/debug_users", methods=["GET"])
 def debug_users():
     session = SessionLocal()
@@ -576,22 +805,7 @@ def debug_users():
     result = []
 
     for user in users:
-        total_refs = user.total_ref_count if user.total_ref_count else user.ref_count
-
-        result.append({
-            "user_id": user.user_id,
-            "username": user.username,
-            "coins": user.coins,
-            "tasks_done": user.tasks_done,
-            "remaining_tasks": user.remaining_tasks,
-            "last_reset_day": user.last_reset_day,
-            "daily_streak": user.daily_streak,
-            "last_checkin_day": user.last_checkin_day,
-            "joined_channel_claimed": user.joined_channel_claimed,
-            "total_ref_count": total_refs,
-            "today_ref_count": user.today_ref_count,
-            "ref_by": user.ref_by
-        })
+        result.append(admin_user_json(user))
 
     session.close()
     return jsonify(result)
