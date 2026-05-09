@@ -32,7 +32,7 @@ engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
 
-DAILY_TASK_LIMIT = 30
+DAILY_TASK_LIMIT = 50
 COOLDOWN_SECONDS = 5
 TASK_TOKEN_EXPIRE = 60
 
