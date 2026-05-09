@@ -44,6 +44,8 @@ RESET_HOUR_WIB = 3
 
 CHECKIN_REWARDS = [2, 6, 8, 10, 14, 18, 25]
 
+MIN_WITHDRAW_POINTS = 10000
+
 # =======================
 # DATABASE TABLE
 # =======================
@@ -86,6 +88,21 @@ class User(Base):
     last_seen_at = Column(DateTime(timezone=True), nullable=True)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class WithdrawRequest(Base):
+    __tablename__ = "withdraw_requests"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(String, index=True)
+    username = Column(String, nullable=True)
+    method = Column(String, nullable=True)
+    account = Column(String, nullable=True)
+    amount = Column(Integer, default=0)
+    status = Column(String, default="pending")
+    admin_note = Column(String, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=True)
 
 Base.metadata.create_all(bind=engine)
 
@@ -714,6 +731,134 @@ def leaderboard():
         "leaderboard": result
     })
 
+
+# =======================
+# WITHDRAW REQUEST V1
+# =======================
+@app.route("/request_withdraw", methods=["POST"])
+def request_withdraw():
+    data = request.json or {}
+
+    user_id = str(data.get("user_id", "")).strip()
+    method = str(data.get("method", "")).strip()
+    account = str(data.get("account", "")).strip()
+    amount = int(data.get("amount", 0))
+
+    if not user_id or user_id == "None":
+        return jsonify({"status": "error", "message": "No user_id"}), 400
+
+    if not method:
+        return jsonify({"status": "error", "message": "Select withdraw method"}), 400
+
+    if not account:
+        return jsonify({"status": "error", "message": "Enter account or wallet"}), 400
+
+    if amount < MIN_WITHDRAW_POINTS:
+        return jsonify({
+            "status": "blocked",
+            "reason": "minimum",
+            "message": f"Minimum withdraw is {MIN_WITHDRAW_POINTS} points"
+        }), 400
+
+    session = SessionLocal()
+    user = session.query(User).filter(User.user_id == user_id).first()
+
+    if not user:
+        session.close()
+        return jsonify({"status": "error", "message": "User not found"}), 404
+
+    if int(user.is_banned or 0) == 1:
+        session.close()
+        return jsonify({"status": "blocked", "reason": "banned", "message": "User banned"}), 403
+
+    if int(user.coins or 0) < amount:
+        session.close()
+        return jsonify({
+            "status": "blocked",
+            "reason": "insufficient_points",
+            "message": "Not enough points"
+        }), 400
+
+    # Prevent many pending withdraws
+    pending = (
+        session.query(WithdrawRequest)
+        .filter(WithdrawRequest.user_id == user_id)
+        .filter(WithdrawRequest.status == "pending")
+        .first()
+    )
+
+    if pending:
+        session.close()
+        return jsonify({
+            "status": "blocked",
+            "reason": "pending_exists",
+            "message": "You already have a pending withdraw request"
+        }), 400
+
+    user.coins -= amount
+
+    wd = WithdrawRequest(
+        user_id=user.user_id,
+        username=user.username,
+        method=method,
+        account=account,
+        amount=amount,
+        status="pending"
+    )
+
+    session.add(wd)
+    session.commit()
+
+    result = {
+        "status": "success",
+        "message": "Withdraw request submitted",
+        "withdraw_id": wd.id,
+        "coins": user.coins,
+        **user_response(user)
+    }
+
+    session.close()
+    return jsonify(result)
+
+@app.route("/my_withdraws", methods=["POST"])
+def my_withdraws():
+    data = request.json or {}
+    user_id = str(data.get("user_id", "")).strip()
+
+    if not user_id or user_id == "None":
+        return jsonify({"status": "error", "message": "No user_id"}), 400
+
+    session = SessionLocal()
+
+    rows = (
+        session.query(WithdrawRequest)
+        .filter(WithdrawRequest.user_id == user_id)
+        .order_by(WithdrawRequest.created_at.desc())
+        .limit(20)
+        .all()
+    )
+
+    result = []
+    for w in rows:
+        result.append({
+            "id": w.id,
+            "method": w.method,
+            "account": w.account,
+            "amount": int(w.amount or 0),
+            "status": w.status,
+            "admin_note": w.admin_note or "",
+            "created_at": str(w.created_at) if w.created_at else "",
+            "updated_at": str(w.updated_at) if w.updated_at else ""
+        })
+
+    session.close()
+
+    return jsonify({
+        "status": "success",
+        "withdraws": result
+    })
+
+
 # =======================
 # ADMIN PANEL API V1
 # =======================
@@ -731,6 +876,9 @@ def admin_stats():
     total_banned = session.query(User).filter(User.is_banned == 1).count()
     channel_claimed = session.query(User).filter(User.joined_channel_claimed == 1).count()
     suspicious_users = session.query(User).filter(User.suspicious_score >= 30).count()
+    pending_withdraws = session.query(WithdrawRequest).filter(WithdrawRequest.status == "pending").count()
+    approved_withdraws = session.query(WithdrawRequest).filter(WithdrawRequest.status == "approved").count()
+    rejected_withdraws = session.query(WithdrawRequest).filter(WithdrawRequest.status == "rejected").count()
 
     session.close()
 
@@ -745,6 +893,9 @@ def admin_stats():
             "banned_users": int(total_banned or 0),
             "channel_claimed": int(channel_claimed or 0),
             "suspicious_users": int(suspicious_users or 0),
+            "pending_withdraws": int(pending_withdraws or 0),
+            "approved_withdraws": int(approved_withdraws or 0),
+            "rejected_withdraws": int(rejected_withdraws or 0),
             "reset_day": reset_day_wib()
         }
     })
@@ -867,6 +1018,108 @@ def admin_suspicious():
         "status": "success",
         "users": result
     })
+
+
+@app.route("/admin_withdraws", methods=["GET"])
+def admin_withdraws():
+    if not admin_ok(request):
+        return jsonify({"status": "error", "message": "Invalid admin key"}), 403
+
+    status = (request.args.get("status") or "pending").strip()
+    limit = int(request.args.get("limit", 100))
+
+    if limit > 300:
+        limit = 300
+
+    session = SessionLocal()
+    query = session.query(WithdrawRequest)
+
+    if status != "all":
+        query = query.filter(WithdrawRequest.status == status)
+
+    rows = query.order_by(WithdrawRequest.created_at.desc()).limit(limit).all()
+
+    result = []
+    for w in rows:
+        result.append({
+            "id": w.id,
+            "user_id": w.user_id,
+            "username": w.username or "",
+            "method": w.method or "",
+            "account": w.account or "",
+            "amount": int(w.amount or 0),
+            "status": w.status,
+            "admin_note": w.admin_note or "",
+            "created_at": str(w.created_at) if w.created_at else "",
+            "updated_at": str(w.updated_at) if w.updated_at else ""
+        })
+
+    session.close()
+
+    return jsonify({
+        "status": "success",
+        "withdraws": result
+    })
+
+@app.route("/admin_update_withdraw", methods=["POST"])
+def admin_update_withdraw():
+    if not admin_ok(request):
+        return jsonify({"status": "error", "message": "Invalid admin key"}), 403
+
+    data = request.json or {}
+    withdraw_id = int(data.get("withdraw_id", 0))
+    action = str(data.get("action", "")).strip()
+    note = str(data.get("note", "")).strip()
+
+    if not withdraw_id:
+        return jsonify({"status": "error", "message": "Missing withdraw_id"}), 400
+
+    session = SessionLocal()
+    wd = session.query(WithdrawRequest).filter(WithdrawRequest.id == withdraw_id).first()
+
+    if not wd:
+        session.close()
+        return jsonify({"status": "error", "message": "Withdraw not found"}), 404
+
+    if wd.status != "pending":
+        session.close()
+        return jsonify({"status": "blocked", "message": "Withdraw already processed"}), 400
+
+    user = session.query(User).filter(User.user_id == wd.user_id).first()
+
+    if action == "approve":
+        wd.status = "approved"
+        wd.admin_note = note
+
+    elif action == "reject":
+        wd.status = "rejected"
+        wd.admin_note = note
+
+        # Refund points on reject
+        if user:
+            user.coins += int(wd.amount or 0)
+
+    else:
+        session.close()
+        return jsonify({"status": "error", "message": "Invalid action"}), 400
+
+    wd.updated_at = datetime.utcnow()
+    session.commit()
+
+    result = {
+        "id": wd.id,
+        "status": wd.status,
+        "user_id": wd.user_id,
+        "amount": int(wd.amount or 0)
+    }
+
+    session.close()
+
+    return jsonify({
+        "status": "success",
+        "withdraw": result
+    })
+
 
 @app.route("/admin_referrals", methods=["GET"])
 def admin_referrals():
