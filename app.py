@@ -4,6 +4,7 @@ from sqlalchemy import create_engine, Column, Integer, String, DateTime, text, f
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.sql import func
 from datetime import datetime, timedelta
+from collections import defaultdict
 import os
 import time
 import secrets
@@ -23,6 +24,11 @@ CHANNEL_REWARD = 15
 
 # GANTI INI NANTI KALAU SUDAH MAU PUBLIC
 ADMIN_KEY = "earnflow_admin_2026"
+
+# Anti Multi Account V1
+MAX_ACCOUNTS_PER_IP = 3
+SUSPICIOUS_SCORE_IP = 30
+SUSPICIOUS_SCORE_REF = 40
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine)
@@ -71,6 +77,13 @@ class User(Base):
     # Admin Panel V1
     is_banned = Column(Integer, default=0)
     admin_note = Column(String, nullable=True)
+
+    # Anti Multi Account V1
+    ip_address = Column(String, nullable=True)
+    device_id = Column(String, nullable=True)
+    suspicious_score = Column(Integer, default=0)
+    suspicious_reason = Column(String, nullable=True)
+    last_seen_at = Column(DateTime(timezone=True), nullable=True)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -125,6 +138,21 @@ def ensure_columns():
         if "admin_note" not in existing:
             conn.execute(text("ALTER TABLE users ADD COLUMN admin_note VARCHAR"))
 
+        if "ip_address" not in existing:
+            conn.execute(text("ALTER TABLE users ADD COLUMN ip_address VARCHAR"))
+
+        if "device_id" not in existing:
+            conn.execute(text("ALTER TABLE users ADD COLUMN device_id VARCHAR"))
+
+        if "suspicious_score" not in existing:
+            conn.execute(text("ALTER TABLE users ADD COLUMN suspicious_score INTEGER DEFAULT 0"))
+
+        if "suspicious_reason" not in existing:
+            conn.execute(text("ALTER TABLE users ADD COLUMN suspicious_reason VARCHAR"))
+
+        if "last_seen_at" not in existing:
+            conn.execute(text("ALTER TABLE users ADD COLUMN last_seen_at TIMESTAMP"))
+
         conn.execute(text("""
             UPDATE users
             SET total_ref_count = ref_count
@@ -141,6 +169,47 @@ ensure_columns()
 def admin_ok(req):
     key = req.args.get("key") or (req.json or {}).get("key") if req.is_json else req.args.get("key")
     return key == ADMIN_KEY
+
+def get_client_ip():
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.remote_addr or ""
+
+def update_user_tracking(session, user, data=None):
+    data = data or {}
+
+    ip = get_client_ip()
+    device_id = str(data.get("device_id", "")).strip()
+
+    if ip:
+        user.ip_address = ip
+
+    if device_id:
+        user.device_id = device_id
+
+    user.last_seen_at = datetime.utcnow()
+
+    reasons = []
+    score = 0
+
+    # Same IP used by too many accounts
+    if ip:
+        same_ip_count = session.query(User).filter(User.ip_address == ip).count()
+        if same_ip_count >= MAX_ACCOUNTS_PER_IP:
+            score += SUSPICIOUS_SCORE_IP
+            reasons.append(f"same_ip_{same_ip_count}_accounts")
+
+    # Referral from same IP
+    if user.ref_by and ip:
+        ref_user = session.query(User).filter(User.user_id == user.ref_by).first()
+        if ref_user and ref_user.ip_address and ref_user.ip_address == ip:
+            score += SUSPICIOUS_SCORE_REF
+            reasons.append("referral_same_ip")
+
+    if score > int(user.suspicious_score or 0):
+        user.suspicious_score = score
+        user.suspicious_reason = ", ".join(reasons)
 
 def reset_day_wib():
     now_wib = datetime.utcnow() + timedelta(hours=7)
@@ -258,6 +327,11 @@ def admin_user_json(user):
         "ref_by": user.ref_by or "",
         "is_banned": int(user.is_banned or 0),
         "admin_note": user.admin_note or "",
+        "ip_address": user.ip_address or "",
+        "device_id": user.device_id or "",
+        "suspicious_score": int(user.suspicious_score or 0),
+        "suspicious_reason": user.suspicious_reason or "",
+        "last_seen_at": str(user.last_seen_at) if user.last_seen_at else "",
         "created_at": str(user.created_at) if user.created_at else ""
     }
 
@@ -299,6 +373,9 @@ def start_user():
         session.add(user)
         session.commit()
 
+        update_user_tracking(session, user, data)
+        session.commit()
+
         if ref and ref != user_id:
             ref_user = session.query(User).filter(User.user_id == ref).first()
 
@@ -318,6 +395,7 @@ def start_user():
         if username:
             user.username = username
 
+        update_user_tracking(session, user, data)
         session.commit()
 
     result = {
@@ -652,6 +730,7 @@ def admin_stats():
     total_today_referrals = session.query(sa_func.coalesce(sa_func.sum(User.today_ref_count), 0)).scalar()
     total_banned = session.query(User).filter(User.is_banned == 1).count()
     channel_claimed = session.query(User).filter(User.joined_channel_claimed == 1).count()
+    suspicious_users = session.query(User).filter(User.suspicious_score >= 30).count()
 
     session.close()
 
@@ -665,6 +744,7 @@ def admin_stats():
             "today_referrals": int(total_today_referrals or 0),
             "banned_users": int(total_banned or 0),
             "channel_claimed": int(channel_claimed or 0),
+            "suspicious_users": int(suspicious_users or 0),
             "reset_day": reset_day_wib()
         }
     })
@@ -762,6 +842,30 @@ def admin_update_user():
     return jsonify({
         "status": "success",
         "user": result
+    })
+
+@app.route("/admin_suspicious", methods=["GET"])
+def admin_suspicious():
+    if not admin_ok(request):
+        return jsonify({"status": "error", "message": "Invalid admin key"}), 403
+
+    session = SessionLocal()
+
+    users = (
+        session.query(User)
+        .filter(User.suspicious_score >= 30)
+        .order_by(User.suspicious_score.desc(), User.coins.desc())
+        .limit(200)
+        .all()
+    )
+
+    result = [admin_user_json(user) for user in users]
+
+    session.close()
+
+    return jsonify({
+        "status": "success",
+        "users": result
     })
 
 @app.route("/admin_referrals", methods=["GET"])
