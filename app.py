@@ -39,6 +39,7 @@ TASK_TOKEN_EXPIRE = 60
 SUPER_TASK_LIMIT = 15
 SUPER_TASK_REWARD = 5
 SUPER_TASK_TOKEN_EXPIRE = 300
+SUPER_TASK_COOLDOWN_SECONDS = 5
 
 REF_LIMIT = 20
 REF_POINT = 10
@@ -61,6 +62,7 @@ class User(Base):
     super_tasks_done = Column(Integer, default=0)
     super_task_token = Column(String, nullable=True)
     super_task_token_time = Column(Integer, default=0)
+    super_last_task_time = Column(Integer, default=0)
     last_reset_day = Column(String, default="")
     daily_streak = Column(Integer, default=0)
     last_checkin_day = Column(String, default="")
@@ -111,6 +113,7 @@ def ensure_columns():
             "super_tasks_done": "ALTER TABLE users ADD COLUMN IF NOT EXISTS super_tasks_done INTEGER DEFAULT 0",
             "super_task_token": "ALTER TABLE users ADD COLUMN IF NOT EXISTS super_task_token VARCHAR",
             "super_task_token_time": "ALTER TABLE users ADD COLUMN IF NOT EXISTS super_task_token_time INTEGER DEFAULT 0",
+            "super_last_task_time": "ALTER TABLE users ADD COLUMN IF NOT EXISTS super_last_task_time INTEGER DEFAULT 0",
             "last_reset_day": "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_reset_day VARCHAR DEFAULT ''",
             "total_ref_count": "ALTER TABLE users ADD COLUMN IF NOT EXISTS total_ref_count INTEGER DEFAULT 0",
             "today_ref_count": "ALTER TABLE users ADD COLUMN IF NOT EXISTS today_ref_count INTEGER DEFAULT 0",
@@ -207,6 +210,7 @@ def reset_daily_if_needed(user):
         user.super_tasks_done = 0
         user.super_task_token = None
         user.super_task_token_time = 0
+        user.super_last_task_time = 0
         user.today_ref_count = 0
         user.last_reset_day = today_key
 
@@ -531,6 +535,7 @@ def claim_super_task():
 
     user.coins += SUPER_TASK_REWARD
     user.super_tasks_done = int(user.super_tasks_done or 0) + 1
+    user.super_last_task_time = now
     user.super_task_token = None
     user.super_task_token_time = 0
     session.commit()
@@ -766,6 +771,7 @@ def admin_update_user():
         user.super_tasks_done = 0
         user.super_task_token = None
         user.super_task_token_time = 0
+        user.super_last_task_time = 0
     elif action == "ban":
         user.is_banned = 1
     elif action == "unban":
