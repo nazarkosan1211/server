@@ -36,6 +36,11 @@ DAILY_TASK_LIMIT = 50
 COOLDOWN_SECONDS = 5
 TASK_TOKEN_EXPIRE = 60
 
+# AdsGram Super Reward Task
+SUPER_TASK_LIMIT = 15
+SUPER_TASK_REWARD = 5
+SUPER_TASK_TOKEN_EXPIRE = 300
+
 REF_LIMIT = 20
 REF_POINT = 10
 RESET_HOUR_WIB = 3
@@ -54,6 +59,9 @@ class User(Base):
     last_task_time = Column(Integer, default=0)
     task_token = Column(String, nullable=True)
     task_token_time = Column(Integer, default=0)
+    super_tasks_done = Column(Integer, default=0)
+    super_task_token = Column(String, nullable=True)
+    super_task_token_time = Column(Integer, default=0)
     last_reset_day = Column(String, default="")
     daily_streak = Column(Integer, default=0)
     last_checkin_day = Column(String, default="")
@@ -194,6 +202,9 @@ def reset_daily_if_needed(user):
         user.last_task_time = 0
         user.task_token = None
         user.task_token_time = 0
+        user.super_tasks_done = 0
+        user.super_task_token = None
+        user.super_task_token_time = 0
         user.today_ref_count = 0
         user.last_reset_day = today_key
 
@@ -226,6 +237,10 @@ def user_response(user):
         "coins": user.coins,
         "tasks_done": user.tasks_done,
         "remaining_tasks": user.remaining_tasks,
+        "super_tasks_done": int(user.super_tasks_done or 0),
+        "super_remaining_tasks": max(0, SUPER_TASK_LIMIT - int(user.super_tasks_done or 0)),
+        "super_task_limit": SUPER_TASK_LIMIT,
+        "super_task_reward": SUPER_TASK_REWARD,
         "ref_count": total_refs,
         "total_ref_count": total_refs,
         "today_ref_count": user.today_ref_count,
@@ -256,6 +271,8 @@ def admin_user_json(user):
         "coins": int(user.coins or 0),
         "tasks_done": int(user.tasks_done or 0),
         "remaining_tasks": int(user.remaining_tasks or 0),
+        "super_tasks_done": int(user.super_tasks_done or 0),
+        "super_remaining_tasks": max(0, SUPER_TASK_LIMIT - int(user.super_tasks_done or 0)),
         "daily_streak": int(user.daily_streak or 0),
         "joined_channel_claimed": int(user.joined_channel_claimed or 0),
         "total_ref_count": int(total_refs or 0),
@@ -273,7 +290,7 @@ def admin_user_json(user):
 
 @app.route("/")
 def root():
-    return jsonify({"status": "online", "message": "EarnFlow server is running", "reset_time": "03:00 WIB", "channel": CHANNEL_USERNAME, "admin": "Admin Panel V1 endpoints active", "cooldown_seconds": COOLDOWN_SECONDS})
+    return jsonify({"status": "online", "message": "EarnFlow server is running", "reset_time": "03:00 WIB", "channel": CHANNEL_USERNAME, "admin": "Admin Panel V1 endpoints active", "cooldown_seconds": COOLDOWN_SECONDS, "super_task_limit": SUPER_TASK_LIMIT, "super_task_reward": SUPER_TASK_REWARD})
 
 @app.route("/start_user", methods=["POST"])
 def start_user():
@@ -421,6 +438,135 @@ def add_coin():
     result = {"status": "success", **user_response(user)}
     session.close()
     return jsonify(result)
+
+
+@app.route("/start_super_task", methods=["POST"])
+def start_super_task():
+    data = request.json or {}
+    user_id = str(data.get("user_id"))
+
+    if not user_id or user_id == "None":
+        return jsonify({"status": "error", "message": "No user_id"}), 400
+
+    session = SessionLocal()
+    user = session.query(User).filter(User.user_id == user_id).first()
+
+    if not user:
+        session.close()
+        return jsonify({"status": "error", "message": "User not found"}), 404
+
+    if int(user.is_banned or 0) == 1:
+        session.close()
+        return jsonify({"status": "blocked", "reason": "banned", "message": "User banned"}), 403
+
+    reset_daily_if_needed(user)
+    session.commit()
+
+    if int(user.super_tasks_done or 0) >= SUPER_TASK_LIMIT:
+        result = {
+            "status": "blocked",
+            "reason": "daily_limit",
+            "message": "Super Reward daily limit reached",
+            **user_response(user)
+        }
+        result["super_remaining_tasks"] = 0
+        session.close()
+        return jsonify(result)
+
+    token = secrets.token_urlsafe(32)
+    now = int(time.time())
+
+    user.super_task_token = token
+    user.super_task_token_time = now
+    session.commit()
+    session.close()
+
+    return jsonify({
+        "status": "success",
+        "super_task_token": token,
+        "expires_in": SUPER_TASK_TOKEN_EXPIRE,
+        "reward": SUPER_TASK_REWARD,
+        "limit": SUPER_TASK_LIMIT
+    })
+
+
+@app.route("/claim_super_task", methods=["POST"])
+def claim_super_task():
+    data = request.json or {}
+    user_id = str(data.get("user_id"))
+    super_task_token = str(data.get("super_task_token") or data.get("token") or "")
+
+    if not user_id or user_id == "None":
+        return jsonify({"status": "error", "message": "No user_id"}), 400
+
+    session = SessionLocal()
+    user = session.query(User).filter(User.user_id == user_id).first()
+
+    if not user:
+        session.close()
+        return jsonify({"status": "error", "message": "User not found"}), 404
+
+    if int(user.is_banned or 0) == 1:
+        session.close()
+        return jsonify({"status": "blocked", "reason": "banned", "message": "User banned"}), 403
+
+    reset_daily_if_needed(user)
+    session.commit()
+    now = int(time.time())
+
+    if int(user.super_tasks_done or 0) >= SUPER_TASK_LIMIT:
+        result = {
+            "status": "blocked",
+            "reason": "daily_limit",
+            "message": "Super Reward daily limit reached",
+            **user_response(user)
+        }
+        result["super_remaining_tasks"] = 0
+        session.close()
+        return jsonify(result)
+
+    if not super_task_token:
+        session.close()
+        return jsonify({
+            "status": "blocked",
+            "reason": "missing_super_task_token",
+            "message": "Invalid Super Reward claim"
+        }), 403
+
+    if not user.super_task_token or super_task_token != user.super_task_token:
+        session.close()
+        return jsonify({
+            "status": "blocked",
+            "reason": "invalid_super_task_token",
+            "message": "Invalid Super Reward claim"
+        }), 403
+
+    if now - int(user.super_task_token_time or 0) > SUPER_TASK_TOKEN_EXPIRE:
+        user.super_task_token = None
+        user.super_task_token_time = 0
+        session.commit()
+        session.close()
+        return jsonify({
+            "status": "blocked",
+            "reason": "expired_super_task_token",
+            "message": "Super Reward task expired"
+        }), 403
+
+    user.coins += SUPER_TASK_REWARD
+    user.super_tasks_done = int(user.super_tasks_done or 0) + 1
+    user.super_task_token = None
+    user.super_task_token_time = 0
+    session.commit()
+
+    result = {
+        "status": "success",
+        "reward": SUPER_TASK_REWARD,
+        "message": "Super Reward completed",
+        **user_response(user)
+    }
+    session.close()
+    return jsonify(result)
+
 
 @app.route("/claim_checkin", methods=["POST"])
 def claim_checkin():
@@ -586,6 +732,7 @@ def admin_stats():
     total_users = session.query(User).count()
     total_points = session.query(sa_func.coalesce(sa_func.sum(User.coins), 0)).scalar()
     total_tasks_done = session.query(sa_func.coalesce(sa_func.sum(User.tasks_done), 0)).scalar()
+    total_super_tasks_done = session.query(sa_func.coalesce(sa_func.sum(User.super_tasks_done), 0)).scalar()
     total_referrals = session.query(sa_func.coalesce(sa_func.sum(User.total_ref_count), 0)).scalar()
     total_today_referrals = session.query(sa_func.coalesce(sa_func.sum(User.today_ref_count), 0)).scalar()
     total_banned = session.query(User).filter(User.is_banned == 1).count()
@@ -595,7 +742,7 @@ def admin_stats():
     approved_withdraws = session.query(WithdrawRequest).filter(WithdrawRequest.status == "approved").count()
     rejected_withdraws = session.query(WithdrawRequest).filter(WithdrawRequest.status == "rejected").count()
     session.close()
-    return jsonify({"status": "success", "stats": {"total_users": int(total_users or 0), "total_points": int(total_points or 0), "total_tasks_done_today": int(total_tasks_done or 0), "total_referrals": int(total_referrals or 0), "today_referrals": int(total_today_referrals or 0), "banned_users": int(total_banned or 0), "channel_claimed": int(channel_claimed or 0), "suspicious_users": int(suspicious_users or 0), "pending_withdraws": int(pending_withdraws or 0), "approved_withdraws": int(approved_withdraws or 0), "rejected_withdraws": int(rejected_withdraws or 0), "reset_day": reset_day_wib(), "cooldown_seconds": COOLDOWN_SECONDS}})
+    return jsonify({"status": "success", "stats": {"total_users": int(total_users or 0), "total_points": int(total_points or 0), "total_tasks_done_today": int(total_tasks_done or 0), "total_super_tasks_done_today": int(total_super_tasks_done or 0), "total_referrals": int(total_referrals or 0), "today_referrals": int(total_today_referrals or 0), "banned_users": int(total_banned or 0), "channel_claimed": int(channel_claimed or 0), "suspicious_users": int(suspicious_users or 0), "pending_withdraws": int(pending_withdraws or 0), "approved_withdraws": int(approved_withdraws or 0), "rejected_withdraws": int(rejected_withdraws or 0), "reset_day": reset_day_wib(), "cooldown_seconds": COOLDOWN_SECONDS}})
 
 @app.route("/admin_users", methods=["GET"])
 def admin_users():
@@ -643,6 +790,13 @@ def admin_update_user():
         user.last_task_time = 0
         user.task_token = None
         user.task_token_time = 0
+        user.super_tasks_done = 0
+        user.super_task_token = None
+        user.super_task_token_time = 0
+    elif action == "reset_super_tasks":
+        user.super_tasks_done = 0
+        user.super_task_token = None
+        user.super_task_token_time = 0
     elif action == "ban":
         user.is_banned = 1
     elif action == "unban":
