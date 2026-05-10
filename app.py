@@ -37,9 +37,17 @@ COOLDOWN_SECONDS = 5
 TASK_TOKEN_EXPIRE = 60
 
 SUPER_TASK_LIMIT = 15
-SUPER_TASK_REWARD = 5
+SUPER_TASK_REWARD = 6
 SUPER_TASK_TOKEN_EXPIRE = 300
 SUPER_TASK_COOLDOWN_SECONDS = 5
+
+EXTRA_TASK_LIMIT = 30
+EXTRA_TASK_COOLDOWN_SECONDS = 5
+EXTRA_TASK_TOKEN_EXPIRE = 300
+EXTRA_TASK_REWARDS = {
+    "extra1": 4,
+    "extra2": 3,
+}
 
 REF_LIMIT = 20
 REF_POINT = 10
@@ -63,6 +71,14 @@ class User(Base):
     super_task_token = Column(String, nullable=True)
     super_task_token_time = Column(Integer, default=0)
     super_last_task_time = Column(Integer, default=0)
+    extra1_tasks_done = Column(Integer, default=0)
+    extra1_task_token = Column(String, nullable=True)
+    extra1_task_token_time = Column(Integer, default=0)
+    extra1_last_task_time = Column(Integer, default=0)
+    extra2_tasks_done = Column(Integer, default=0)
+    extra2_task_token = Column(String, nullable=True)
+    extra2_task_token_time = Column(Integer, default=0)
+    extra2_last_task_time = Column(Integer, default=0)
     last_reset_day = Column(String, default="")
     daily_streak = Column(Integer, default=0)
     last_checkin_day = Column(String, default="")
@@ -114,6 +130,14 @@ def ensure_columns():
             "super_task_token": "ALTER TABLE users ADD COLUMN IF NOT EXISTS super_task_token VARCHAR",
             "super_task_token_time": "ALTER TABLE users ADD COLUMN IF NOT EXISTS super_task_token_time INTEGER DEFAULT 0",
             "super_last_task_time": "ALTER TABLE users ADD COLUMN IF NOT EXISTS super_last_task_time INTEGER DEFAULT 0",
+            "extra1_tasks_done": "ALTER TABLE users ADD COLUMN IF NOT EXISTS extra1_tasks_done INTEGER DEFAULT 0",
+            "extra1_task_token": "ALTER TABLE users ADD COLUMN IF NOT EXISTS extra1_task_token VARCHAR",
+            "extra1_task_token_time": "ALTER TABLE users ADD COLUMN IF NOT EXISTS extra1_task_token_time INTEGER DEFAULT 0",
+            "extra1_last_task_time": "ALTER TABLE users ADD COLUMN IF NOT EXISTS extra1_last_task_time INTEGER DEFAULT 0",
+            "extra2_tasks_done": "ALTER TABLE users ADD COLUMN IF NOT EXISTS extra2_tasks_done INTEGER DEFAULT 0",
+            "extra2_task_token": "ALTER TABLE users ADD COLUMN IF NOT EXISTS extra2_task_token VARCHAR",
+            "extra2_task_token_time": "ALTER TABLE users ADD COLUMN IF NOT EXISTS extra2_task_token_time INTEGER DEFAULT 0",
+            "extra2_last_task_time": "ALTER TABLE users ADD COLUMN IF NOT EXISTS extra2_last_task_time INTEGER DEFAULT 0",
             "last_reset_day": "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_reset_day VARCHAR DEFAULT ''",
             "total_ref_count": "ALTER TABLE users ADD COLUMN IF NOT EXISTS total_ref_count INTEGER DEFAULT 0",
             "today_ref_count": "ALTER TABLE users ADD COLUMN IF NOT EXISTS today_ref_count INTEGER DEFAULT 0",
@@ -211,6 +235,14 @@ def reset_daily_if_needed(user):
         user.super_task_token = None
         user.super_task_token_time = 0
         user.super_last_task_time = 0
+        user.extra1_tasks_done = 0
+        user.extra1_task_token = None
+        user.extra1_task_token_time = 0
+        user.extra1_last_task_time = 0
+        user.extra2_tasks_done = 0
+        user.extra2_task_token = None
+        user.extra2_task_token_time = 0
+        user.extra2_last_task_time = 0
         user.today_ref_count = 0
         user.last_reset_day = today_key
 
@@ -245,7 +277,16 @@ def user_response(user):
         "remaining_tasks": user.remaining_tasks,
         "super_tasks_done": int(user.super_tasks_done or 0),
         "super_remaining_tasks": max(0, SUPER_TASK_LIMIT - int(user.super_tasks_done or 0)),
+        "extra1_tasks_done": int(user.extra1_tasks_done or 0),
+        "extra2_tasks_done": int(user.extra2_tasks_done or 0),
         "super_task_limit": SUPER_TASK_LIMIT,
+        "extra1_tasks_done": int(user.extra1_tasks_done or 0),
+        "extra1_remaining_tasks": max(0, EXTRA_TASK_LIMIT - int(user.extra1_tasks_done or 0)),
+        "extra1_reward": EXTRA_TASK_REWARDS["extra1"],
+        "extra2_tasks_done": int(user.extra2_tasks_done or 0),
+        "extra2_remaining_tasks": max(0, EXTRA_TASK_LIMIT - int(user.extra2_tasks_done or 0)),
+        "extra2_reward": EXTRA_TASK_REWARDS["extra2"],
+        "extra_task_limit": EXTRA_TASK_LIMIT,
         "ref_count": total_refs,
         "total_ref_count": total_refs,
         "today_ref_count": user.today_ref_count,
@@ -278,6 +319,8 @@ def admin_user_json(user):
         "remaining_tasks": int(user.remaining_tasks or 0),
         "super_tasks_done": int(user.super_tasks_done or 0),
         "super_remaining_tasks": max(0, SUPER_TASK_LIMIT - int(user.super_tasks_done or 0)),
+        "extra1_tasks_done": int(user.extra1_tasks_done or 0),
+        "extra2_tasks_done": int(user.extra2_tasks_done or 0),
         "daily_streak": int(user.daily_streak or 0),
         "joined_channel_claimed": int(user.joined_channel_claimed or 0),
         "total_ref_count": int(total_refs or 0),
@@ -545,6 +588,161 @@ def claim_super_task():
     return jsonify(result)
 
 
+
+def extra_task_config(task_key):
+    if task_key not in EXTRA_TASK_REWARDS:
+        return None
+
+    if task_key == "extra1":
+        return {
+            "done_attr": "extra1_tasks_done",
+            "token_attr": "extra1_task_token",
+            "token_time_attr": "extra1_task_token_time",
+            "last_time_attr": "extra1_last_task_time",
+            "reward": EXTRA_TASK_REWARDS["extra1"],
+        }
+
+    if task_key == "extra2":
+        return {
+            "done_attr": "extra2_tasks_done",
+            "token_attr": "extra2_task_token",
+            "token_time_attr": "extra2_task_token_time",
+            "last_time_attr": "extra2_last_task_time",
+            "reward": EXTRA_TASK_REWARDS["extra2"],
+        }
+
+    return None
+
+
+@app.route("/start_extra_task", methods=["POST"])
+def start_extra_task():
+    data = request.json or {}
+    user_id = str(data.get("user_id"))
+    task_key = str(data.get("task_key", "")).strip()
+
+    cfg = extra_task_config(task_key)
+
+    if not cfg:
+        return jsonify({"status": "error", "message": "Invalid extra task"}), 400
+
+    if not user_id or user_id == "None":
+        return jsonify({"status": "error", "message": "No user_id"}), 400
+
+    session = SessionLocal()
+    user = session.query(User).filter(User.user_id == user_id).first()
+
+    if not user:
+        session.close()
+        return jsonify({"status": "error", "message": "User not found"}), 404
+
+    if int(user.is_banned or 0) == 1:
+        session.close()
+        return jsonify({"status": "blocked", "reason": "banned", "message": "User banned"}), 403
+
+    reset_daily_if_needed(user)
+    now = int(time.time())
+
+    done = int(getattr(user, cfg["done_attr"]) or 0)
+    last_time = int(getattr(user, cfg["last_time_attr"]) or 0)
+
+    if done >= EXTRA_TASK_LIMIT:
+        result = {"status": "blocked", "reason": "daily_limit", **user_response(user)}
+        session.commit()
+        session.close()
+        return jsonify(result)
+
+    if last_time and now - last_time < EXTRA_TASK_COOLDOWN_SECONDS:
+        wait = EXTRA_TASK_COOLDOWN_SECONDS - (now - last_time)
+        result = {"status": "blocked", "reason": "cooldown", "wait": wait, **user_response(user)}
+        session.commit()
+        session.close()
+        return jsonify(result)
+
+    token = secrets.token_urlsafe(32)
+    setattr(user, cfg["token_attr"], token)
+    setattr(user, cfg["token_time_attr"], now)
+    session.commit()
+
+    result = {
+        "status": "success",
+        "task_key": task_key,
+        "extra_task_token": token,
+        "reward": cfg["reward"],
+        "expires_in": EXTRA_TASK_TOKEN_EXPIRE,
+        **user_response(user)
+    }
+
+    session.close()
+    return jsonify(result)
+
+
+@app.route("/claim_extra_task", methods=["POST"])
+def claim_extra_task():
+    data = request.json or {}
+    user_id = str(data.get("user_id"))
+    task_key = str(data.get("task_key", "")).strip()
+    extra_task_token = str(data.get("extra_task_token") or data.get("token") or "")
+
+    cfg = extra_task_config(task_key)
+
+    if not cfg:
+        return jsonify({"status": "error", "message": "Invalid extra task"}), 400
+
+    if not user_id or user_id == "None":
+        return jsonify({"status": "error", "message": "No user_id"}), 400
+
+    session = SessionLocal()
+    user = session.query(User).filter(User.user_id == user_id).first()
+
+    if not user:
+        session.close()
+        return jsonify({"status": "error", "message": "User not found"}), 404
+
+    if int(user.is_banned or 0) == 1:
+        session.close()
+        return jsonify({"status": "blocked", "reason": "banned", "message": "User banned"}), 403
+
+    reset_daily_if_needed(user)
+    now = int(time.time())
+
+    done = int(getattr(user, cfg["done_attr"]) or 0)
+
+    if done >= EXTRA_TASK_LIMIT:
+        result = {"status": "blocked", "reason": "daily_limit", **user_response(user)}
+        session.commit()
+        session.close()
+        return jsonify(result)
+
+    if not extra_task_token:
+        session.close()
+        return jsonify({"status": "blocked", "reason": "missing_extra_task_token", "message": "Invalid claim"}), 403
+
+    saved_token = getattr(user, cfg["token_attr"])
+    saved_token_time = int(getattr(user, cfg["token_time_attr"]) or 0)
+
+    if not saved_token or extra_task_token != saved_token:
+        session.close()
+        return jsonify({"status": "blocked", "reason": "invalid_extra_task_token", "message": "Invalid claim"}), 403
+
+    if now - saved_token_time > EXTRA_TASK_TOKEN_EXPIRE:
+        setattr(user, cfg["token_attr"], None)
+        setattr(user, cfg["token_time_attr"], 0)
+        session.commit()
+        session.close()
+        return jsonify({"status": "blocked", "reason": "expired_extra_task_token", "message": "Extra Task expired"}), 403
+
+    user.coins += cfg["reward"]
+    setattr(user, cfg["done_attr"], done + 1)
+    setattr(user, cfg["last_time_attr"], now)
+    setattr(user, cfg["token_attr"], None)
+    setattr(user, cfg["token_time_attr"], 0)
+    session.commit()
+
+    result = {"status": "success", "task_key": task_key, "reward": cfg["reward"], **user_response(user)}
+    session.close()
+    return jsonify(result)
+
+
 @app.route("/claim_checkin", methods=["POST"])
 def claim_checkin():
     data = request.json or {}
@@ -772,6 +970,15 @@ def admin_update_user():
         user.super_task_token = None
         user.super_task_token_time = 0
         user.super_last_task_time = 0
+    elif action == "reset_extra_tasks":
+        user.extra1_tasks_done = 0
+        user.extra1_task_token = None
+        user.extra1_task_token_time = 0
+        user.extra1_last_task_time = 0
+        user.extra2_tasks_done = 0
+        user.extra2_task_token = None
+        user.extra2_task_token_time = 0
+        user.extra2_last_task_time = 0
     elif action == "ban":
         user.is_banned = 1
     elif action == "unban":
